@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-chroma
+langchain-text-splitters
+sentence-transformers
+chromadb
+requests
+python-dotenv
+torch
+python-dateutil
+unstructured
+matplotlib
+japanize-matplotlib
