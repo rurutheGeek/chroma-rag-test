@@ -609,3 +609,4 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+.chroma/chroma.sqlite3

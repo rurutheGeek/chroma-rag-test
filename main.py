@@ -5,6 +5,7 @@ from langchain_chroma import Chroma
 from langchain_classic.chains import RetrievalQA # 非推奨
 from langchain_core.language_models.llms import LLM
 from langchain_core.prompts import PromptTemplate
+from langchain_core.callbacks import BaseCallbackHandler
 import chromadb
 from chromadb.config import Settings
 from chromadb import PersistentClient
@@ -18,7 +19,8 @@ import time
 from contextlib import contextmanager
 import matplotlib.pyplot as plt
 import japanize_matplotlib
-from shared_logger import set_logger
+from shared_logger import set_logger, get_logger
+
 
 # タイムロギング
 class TimelineLogger:
@@ -37,6 +39,63 @@ class TimelineLogger:
         self.records.append((name, start_time, end_time))
         print(f"[{name}] 完了 ({end_time - start_time:.4f}秒)")
 
+
+# ---------------------------------------------------------
+# 修正版: PerformanceCallbackHandler
+# ---------------------------------------------------------
+class PerformanceCallbackHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.llm_start_time = 0
+        
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        # ロガーに合わせて perf_counter を使用
+        self.llm_start_time = time.perf_counter()
+        print(f"[LLM 回答生成] 開始")
+
+    def on_llm_end(self, response, **kwargs):
+        end_time = time.perf_counter()
+        duration = end_time - self.llm_start_time
+        print(f"[LLM 回答生成] 完了 ({duration:.4f}秒)")
+
+        # 共通ロガーを取得してレコードに直接追加
+        logger_instance = get_logger()
+        if logger_instance:
+            # (イベント名, 開始, 終了) の形式で追加
+            logger_instance.records.append(("LLM 回答生成", self.llm_start_time, end_time))
+
+# ---------------------------------------------------------
+# 修正版: MeasuredEmbeddings
+# ---------------------------------------------------------
+class MeasuredEmbeddings:
+    def __init__(self, wrapped_embeddings):
+        self.wrapped_embeddings = wrapped_embeddings
+
+    def embed_documents(self, texts):
+        logger_instance = get_logger()
+        # ドキュメント登録時の埋め込み計測
+        if logger_instance:
+            # 詳細分析のためバッチサイズも記録
+            with logger_instance.log_event(f"ドキュメント埋め込み (batch {len(texts)})"):
+                return self.wrapped_embeddings.embed_documents(texts)
+        else:
+            return self.wrapped_embeddings.embed_documents(texts)
+
+    def embed_query(self, text):
+        logger_instance = get_logger()
+        # 検索クエリ埋め込み時（ここを計測）
+        if logger_instance:
+            with logger_instance.log_event("クエリ埋め込み"):
+                return self.wrapped_embeddings.embed_query(text)
+        else:
+            # ロガーがない場合のフォールバック（printのみ）
+            start = time.perf_counter()
+            result = self.wrapped_embeddings.embed_query(text)
+            end = time.perf_counter()
+            print(f"[クエリ埋め込み] 完了 ({end - start:.4f}秒)")
+            return result
+        
+
+
 def plot_timeline(records: list, output_filename: str = "timeline.png"):
     """
     (イベント名, 開始時刻, 終了時刻) のリストから
@@ -46,44 +105,52 @@ def plot_timeline(records: list, output_filename: str = "timeline.png"):
         print("描画するデータがありません。")
         return
     
-    # 日本語フォントの設定（macOS/Windowsの一般的な例）
-    #try:
-    #    # for mac
-    #   plt.rcParams['font.family'] = 'Hiragino Sans'
-    #except:
-    #    try:
-    #        # for windows
-    #        plt.rcParams['font.family'] = 'Meiryo'
-    #    except:
-    #        # for linux/colab etc.
-    #        plt.rcParams['font.family'] = 'sans-serif'
-    #        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-    #        print("日本語フォントが見つからないため、デフォルトフォントで描画します。")
-
     # データから描画用の要素を抽出
+    base_time = min(rec[1] for rec in records)
     event_names = [rec[0] for rec in records]
-    start_times = [rec[1] for rec in records]
-    end_times = [rec[2] for rec in records]
+    start_times = [rec[1] - base_time for rec in records]
+    end_times = [rec[2] - base_time for rec in records]
     
     # 各イベントの処理時間（棒の長さ）を計算
     durations = [end - start for start, end in zip(start_times, end_times)]
 
-    # 描画処理
-    fig, ax = plt.subplots(figsize=(10, len(event_names) * 0.5))
+    # --- 色の決定ロジック (追加) ---
+    colors = []
+    for name in event_names:
+        if "全体フロー" == name or "ドキュメントロードと分割" == name :
+            colors.append('#d3d3d3')  # ライトグレー（背景的に扱う）
+        else:
+            colors.append('#1f77b4')  # 青系（デフォルト：VDB/Embedding等の重要処理）
 
-    # 横棒グラフを描画 (left=start_times がタイムラインの鍵)
-    ax.barh(event_names, durations, left=start_times, height=0.6)
+    # 描画処理
+    fig, ax = plt.subplots(figsize=(12, len(event_names) * 0.6 + 1))
+
+    # 横棒グラフを描画 (color引数にリストを渡して色分け)
+    bars = ax.barh(event_names, durations, left=start_times, height=0.6, color=colors)
+
+    # 数値ラベルの追加
+    for bar, duration in zip(bars, durations):
+        width = bar.get_width()
+        # 0.00001秒単位まで表示
+        label_text = f" {duration:.5f} s"
+        ax.text(bar.get_x() + width, bar.get_y() + bar.get_height()/2, label_text, 
+                va='center', fontsize=9, color='black')
 
     # 見た目を整える
     ax.invert_yaxis()  # 最初のイベントが上に来るようにする
     ax.set_xlabel("時間 (秒)")
     ax.set_title("処理タイムライン")
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    
+    # ラベルが見切れないようにX軸の範囲を調整
+    max_end = max([s + d for s, d in zip(start_times, durations)])
+    ax.set_xlim(0, max_end * 1.15)
 
     # 画像を保存
     plt.tight_layout()
     plt.savefig(output_filename)
     print(f"'{output_filename}' として画像を保存しました。")
+    
 
 def convert_records_to_relative(records: list) -> list:
     """
@@ -147,6 +214,8 @@ class DeepSeekAPI(LLM):
 
 # 1. PDF／TXT ドキュメントロード＆分割
 def load_and_split(folder: str):
+    logger_instance = get_logger()
+    
     # 必要なディレクトリを作成
     os.makedirs("data", exist_ok=True)
     os.makedirs("data/input", exist_ok=True)
@@ -156,58 +225,68 @@ def load_and_split(folder: str):
     if not os.path.exists(folder):
         raise FileNotFoundError(f"入力ディレクトリ '{folder}' が見つかりません。")
     
-    # 各ファイルタイプの存在確認
-    has_pdf = any(f.endswith('.pdf') for f in os.listdir(folder))
-    has_txt = any(f.endswith('.txt') for f in os.listdir(folder))
-    has_jsonl = any(f.endswith('.jsonl') for f in os.listdir(folder))
+    all_docs = []
     
-    if not (has_pdf or has_txt or has_jsonl):
-        raise ValueError(f"ディレクトリ '{folder}' に対応するファイル（.pdf, .txt, .jsonl）が見つかりません。")
+    # --- ファイルロード処理の計測（追加） ---
+    # ロガーがあれば計測コンテキストを作成、なければ何もしないコンテキスト
+    ctx_load = logger_instance.log_event("ファイル読み込み") if logger_instance else contextmanager(lambda: (yield))()
     
-    # PDF をロード
-    pdf_docs = []
-    if has_pdf:
-        pdf_loader = DirectoryLoader(
-            folder,
-            glob="*.pdf",
-            loader_cls=PyPDFLoader
-        )
-        pdf_docs = pdf_loader.load()
-        print(f"[DEBUG] Loaded PDF docs: {len(pdf_docs)}")
-    
-    # TXT をロード
-    txt_docs = []
-    if has_txt:
-        txt_loader = DirectoryLoader(folder, glob="*.txt")
-        txt_docs = txt_loader.load()
-        print(f"[DEBUG] Loaded TXT docs: {len(txt_docs)}")
-    
-    # JSONL をロード
-    jsonl_docs = []
-    if has_jsonl:
-        jsonl_loader = DirectoryLoader(
-            folder,
-            glob="*.jsonl",
-            loader_cls=JSONLoader,
-            loader_kwargs={
-                "jq_schema": "{text: (\"作成日時: \" + .created_at + \"\n\" + .full_text)}",  # 日付情報とツイート本文を抽出
-                "json_lines": True,         # JSONL モードを有効化
-                "text_content": True,       # 抽出結果を文字列として扱う
-                "content_key": "text"       # 本文のキー
-            }
-        )
-        jsonl_docs = jsonl_loader.load()
-        print(f"[DEBUG] Loaded JSONL docs: {len(jsonl_docs)}")
+    with ctx_load:
+        # 各ファイルタイプの存在確認
+        has_pdf = any(f.endswith('.pdf') for f in os.listdir(folder))
+        has_txt = any(f.endswith('.txt') for f in os.listdir(folder))
+        has_jsonl = any(f.endswith('.jsonl') for f in os.listdir(folder))
+        
+        if not (has_pdf or has_txt or has_jsonl):
+            raise ValueError(f"ディレクトリ '{folder}' に対応するファイル（.pdf, .txt, .jsonl）が見つかりません。")
+        
+        # PDF をロード
+        if has_pdf:
+            pdf_loader = DirectoryLoader(
+                folder,
+                glob="*.pdf",
+                loader_cls=PyPDFLoader
+            )
+            all_docs.extend(pdf_loader.load())
+            print(f"[DEBUG] Loaded PDF docs: {len(all_docs)}") # 簡易デバッグ用
+        
+        # TXT をロード
+        if has_txt:
+            txt_loader = DirectoryLoader(folder, glob="*.txt")
+            all_docs.extend(txt_loader.load())
+            print(f"[DEBUG] Loaded TXT docs (accumulated): {len(all_docs)}")
+        
+        # JSONL をロード
+        if has_jsonl:
+            jsonl_loader = DirectoryLoader(
+                folder,
+                glob="*.jsonl",
+                loader_cls=JSONLoader,
+                loader_kwargs={
+                    "jq_schema": "{text: (\"作成日時: \" + .created_at + \"\n\" + .full_text)}",  # 日付情報とツイート本文を抽出
+                    "json_lines": True,         # JSONL モードを有効化
+                    "text_content": True,       # 抽出結果を文字列として扱う
+                    "content_key": "text"       # 本文のキー
+                }
+            )
+            all_docs.extend(jsonl_loader.load())
+            print(f"[DEBUG] Loaded JSONL docs (accumulated): {len(all_docs)}")
 
-    all_docs = pdf_docs + txt_docs + jsonl_docs
     if not all_docs:
         raise ValueError("有効なドキュメントが見つかりませんでした。")
     
     print(f"[DEBUG] Total raw docs: {len(all_docs)}")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    split_docs = splitter.split_documents(all_docs)
+
+    # --- 分割処理の計測（追加） ---
+    ctx_split = logger_instance.log_event("チャンク分割") if logger_instance else contextmanager(lambda: (yield))()
+    
+    with ctx_split:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+        split_docs = splitter.split_documents(all_docs)
+        
     print(f"[DEBUG] Total split docs: {len(split_docs)}")
     return split_docs
+
 
 # 3. 埋め込みモデル初期化
 # GPUが利用可能かどうかを確認
@@ -219,10 +298,13 @@ embeddings = HuggingFaceEmbeddings(
     model_kwargs={"device": device},
     encode_kwargs={"normalize_embeddings": True}
 )
+embeddings = MeasuredEmbeddings(embeddings)
 
 # 4. ChromaDB にベクトル登録
 def build_vector_store(docs, embeddings):
     print("ベクトルストアの構築を開始します...")
+    logger_instance = get_logger()
+
     try:
         client = PersistentClient(path=".chroma")
         collection_name = "my_collection"
@@ -235,12 +317,7 @@ def build_vector_store(docs, embeddings):
             return col
         except Exception as e:
             print(f"新しいコレクション '{collection_name}' を作成します")
-            # 既存のコレクションを削除（存在する場合）
-            try:
-                client.delete_collection(collection_name)
-                print(f"既存のコレクション '{collection_name}' を削除しました")
-            except:
-                pass
+            # 既存のコレクションを削除する処理は削除しました（手動で行うため）
             
             # 新しいコレクションを作成
             col = client.create_collection(collection_name)
@@ -255,14 +332,20 @@ def build_vector_store(docs, embeddings):
                 batch_contents = contents[i:i + BATCH_SIZE]
                 print(f"[INFO] Processing batch {i//BATCH_SIZE + 1}/{(total_docs + BATCH_SIZE - 1)//BATCH_SIZE}")
                 
-                # バッチごとに埋め込みを計算
+                # バッチごとに埋め込みを計算 (MeasuredEmbeddingsで計測)
                 embs = embeddings.embed_documents(batch_contents)
                 
                 # バッチごとにIDを生成
                 batch_ids = [f"doc_{i + j}" for j in range(len(batch_contents))]
                 
                 # バッチをベクトルストアに追加
-                col.add(documents=batch_contents, embeddings=embs, ids=batch_ids)
+                # --- 追加処理の計測（追加） ---
+                if logger_instance:
+                    with logger_instance.log_event(f"ChromaDB登録 (batch {len(batch_contents)})"):
+                        col.add(documents=batch_contents, embeddings=embs, ids=batch_ids)
+                else:
+                    col.add(documents=batch_contents, embeddings=embs, ids=batch_ids)
+                
                 print(f"[INFO] Added batch of {len(batch_contents)} documents")
             
             print("ベクトルストアへの登録完了")
@@ -273,6 +356,7 @@ def build_vector_store(docs, embeddings):
     except Exception as e:
         print(f"ベクトルストア構築エラー: {e}")
         raise
+
 
 # 5. RAG チェーン初期化
 def init_qa_chain(collection_name: str, deepllm):
@@ -331,50 +415,56 @@ if __name__ == "__main__":
 
 
     # ---------------------------------------------------------
-    # モンキーパッチ適用開始
+    # モンキーパッチ適用開始 (LangChain対応版)
     # ---------------------------------------------------------
-    import chromadb.api.client
-    from shared_logger import get_logger
+    import chromadb.api.models.Collection
 
-    # 1. ターゲット（特定したクラスとメソッド）を保存
-    target_class = chromadb.api.client.Client
-    original_query_method = target_class._query
+    # 1. ターゲットを Collection クラスに変更
+    target_class = chromadb.api.models.Collection.Collection
+    original_query_method = target_class.query
 
     # 2. 差し替え用のメソッドを定義
-    # *args, **kwargs を使うことで、引数の変更に柔軟に対応
     def patched_query(self, *args, **kwargs):
         logger_instance = get_logger()
-        
-        # ロガーが取得できた場合のみ計測
+        # ロガー取得成功時のみ計測
         if logger_instance:
-            with logger_instance.log_event("ChromaDB検索(パッチ計測)"):
+            with logger_instance.log_event("ChromaDB検索(パッチ)"):
                 return original_query_method(self, *args, **kwargs)
         else:
             return original_query_method(self, *args, **kwargs)
 
-    # 3. メソッドを上書き（パッチ適用）
-    target_class._query = patched_query
-    print(f"[INFO] {target_class.__name__}._query に計測パッチを適用しました")
-    # ---------------------------------------------------------
+    # 3. メソッドを上書き
+    target_class.query = patched_query
+    print(f"[INFO] {target_class.__name__}.query に計測パッチを適用しました")
+    # ---------------------------------------------------------import time
+
+    # 既存のembed_queryメソッドを退避
+    original_embed_query = embeddings.embed_query
+
+    def measured_embed_query(text):
+        start = time.time()
+        # 本来の処理を実行
+        result = original_embed_query(text)
+        end = time.time()
+        
+        duration = end - start
+        print(f"[クエリ埋め込み] 完了 ({duration:.4f}秒)")
+        # 必要ならここでリストなどに時間を記録する
+        return result
+
+    # メソッドを差し替え
+    embeddings.embed_query = measured_embed_query
+
+
+
 
     # 環境変数からキー取得
     DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
-
-
 
     # ChromaDBクライアントの初期化
     client = PersistentClient(path=".chroma")
     collection_name = "my_collection"
 
-    # 実態を調査
-    import inspect
-    # クライアントのクラス名を表示
-    print(f"Type of client: {type(client)}")
-    # クライアントが定義されているファイルパスを表示
-    print(f"Source file: {inspect.getsourcefile(type(client))}")
-    # clientが持っている属性やメソッドの一覧を表示（'query' や 'search' っぽい名前を探す）
-    print("Methods/Attributes:", [m for m in dir(client) if not m.startswith("__")])
-    
     print("全体フローを開始...")
     with logger.log_event("全体フロー"):
         
@@ -414,34 +504,33 @@ if __name__ == "__main__":
                 continue
                 
             
-            with logger.log_event("検索全体（埋め込み＋検索）"):# 検索の直前にこの1行を入れる
-                # 質問に対する回答を取得
-                result = qa.invoke({"query": query})
-                answer = result["result"]
-                source_docs = result.get("source_documents", [])
-                
-                print("\n回答:", answer)
-                
-                # クエリと回答をMarkdownファイルとして保存
-                output_dir = "data/output"
-                os.makedirs(output_dir, exist_ok=True)
-                
-                # タイムスタンプを含むファイル名を生成
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_file = os.path.join(output_dir, f"qa_{timestamp}.md")
-                
-                # Markdown形式でクエリと回答を記録
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write("# 質問と回答\n\n")
-                    f.write(f"## 質問\n{query}\n\n")
-                    f.write(f"## 回答\n{answer}\n\n")
-                    f.write("## 参照したソースドキュメント\n\n")
-                    for i, doc in enumerate(source_docs, 1):
-                        f.write(f"### ソース {i}\n")
-                        f.write(f"```\n{doc.page_content}\n```\n\n")
-                
-                print(f"\n質問と回答を {output_file} に保存しました")
-                break # 1回で終了
+            # 質問に対する回答を取得
+            result = qa.invoke({"query": query}, config={"callbacks": [PerformanceCallbackHandler()]})
+            answer = result["result"]
+            source_docs = result.get("source_documents", [])
+            
+            print("\n回答:", answer)
+            
+            # クエリと回答をMarkdownファイルとして保存
+            output_dir = "data/output"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # タイムスタンプを含むファイル名を生成
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(output_dir, f"qa_{timestamp}.md")
+            
+            # Markdown形式でクエリと回答を記録
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write("# 質問と回答\n\n")
+                f.write(f"## 質問\n{query}\n\n")
+                f.write(f"## 回答\n{answer}\n\n")
+                f.write("## 参照したソースドキュメント\n\n")
+                for i, doc in enumerate(source_docs, 1):
+                    f.write(f"### ソース {i}\n")
+                    f.write(f"```\n{doc.page_content}\n```\n\n")
+            
+            print(f"\n質問と回答を {output_file} に保存しました")
+            break # 1回で終了
 
 
     # 3. 記録済みの絶対時刻データを、描画用の相対時刻データに変換 ➡️
