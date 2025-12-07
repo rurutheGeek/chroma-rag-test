@@ -329,13 +329,51 @@ if __name__ == "__main__":
     set_logger(logger)
     load_dotenv()  # .env の内容を os.environ に反映
 
+
+    # ---------------------------------------------------------
+    # モンキーパッチ適用開始
+    # ---------------------------------------------------------
+    import chromadb.api.client
+    from shared_logger import get_logger
+
+    # 1. ターゲット（特定したクラスとメソッド）を保存
+    target_class = chromadb.api.client.Client
+    original_query_method = target_class._query
+
+    # 2. 差し替え用のメソッドを定義
+    # *args, **kwargs を使うことで、引数の変更に柔軟に対応
+    def patched_query(self, *args, **kwargs):
+        logger_instance = get_logger()
+        
+        # ロガーが取得できた場合のみ計測
+        if logger_instance:
+            with logger_instance.log_event("ChromaDB検索(パッチ計測)"):
+                return original_query_method(self, *args, **kwargs)
+        else:
+            return original_query_method(self, *args, **kwargs)
+
+    # 3. メソッドを上書き（パッチ適用）
+    target_class._query = patched_query
+    print(f"[INFO] {target_class.__name__}._query に計測パッチを適用しました")
+    # ---------------------------------------------------------
+
     # 環境変数からキー取得
     DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+
 
     # ChromaDBクライアントの初期化
     client = PersistentClient(path=".chroma")
     collection_name = "my_collection"
 
+    # 実態を調査
+    import inspect
+    # クライアントのクラス名を表示
+    print(f"Type of client: {type(client)}")
+    # クライアントが定義されているファイルパスを表示
+    print(f"Source file: {inspect.getsourcefile(type(client))}")
+    # clientが持っている属性やメソッドの一覧を表示（'query' や 'search' っぽい名前を探す）
+    print("Methods/Attributes:", [m for m in dir(client) if not m.startswith("__")])
     
     print("全体フローを開始...")
     with logger.log_event("全体フロー"):
@@ -376,7 +414,7 @@ if __name__ == "__main__":
                 continue
                 
             
-            with logger.log_event("検索全体（埋め込み＋検索）"):
+            with logger.log_event("検索全体（埋め込み＋検索）"):# 検索の直前にこの1行を入れる
                 # 質問に対する回答を取得
                 result = qa.invoke({"query": query})
                 answer = result["result"]
