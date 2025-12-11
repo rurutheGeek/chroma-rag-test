@@ -1,6 +1,6 @@
 #.gitkeepファイルを目印として空のディレクトリを追跡する
 !.gitkeep
-.chrome/
+.chroma
 data/input/*
 data/output/*
 *.png

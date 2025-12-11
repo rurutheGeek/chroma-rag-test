@@ -21,83 +21,24 @@ import matplotlib.pyplot as plt
 import japanize_matplotlib
 from shared_logger import set_logger, get_logger
 
-# ---------------------------------------------------------
-# Rust版対応 計測モンキーパッチ (L1用)
-# ---------------------------------------------------------
-import chromadb.api.models.Collection
 
-# 1. Collection.add (表層: 受付)
-target_collection = chromadb.api.models.Collection.Collection
-original_collection_add = target_collection.add
-
-def patched_collection_add(self, *args, **kwargs):
-    logger_instance = get_logger()
-    count = 0
-    if "ids" in kwargs: count = len(kwargs["ids"])
-    elif len(args) > 0: count = len(args[0])
-
-    if logger_instance:
-        # layer="L1" を指定してファイルに書き込む
-        with logger_instance.log_event(f"ChromaDB登録 (batch {count})", layer="L1"):
-            return original_collection_add(self, *args, **kwargs)
-    else:
-        return original_collection_add(self, *args, **kwargs)
-
-target_collection.add = patched_collection_add
-print(f"[INFO] Patch applied: Collection.add (L1 Logging)")
-
-
-import csv
-
+# タイムロギング
 class TimelineLogger:
-    def __init__(self, log_file="profile_log.csv"):
+    def __init__(self):
+        # (イベント名, 開始時刻, 終了時刻) のタプルを保存するリスト
         self.records = []
-        self.log_file = log_file
-        
-        # 起動時にログファイルを初期化（空にする）
-        with open(self.log_file, "w", newline="") as f:
-            pass # create new empty file
+        self._start_times = {}
 
     @contextmanager
-    def log_event(self, name: str, layer: str = "L1"):
-        """
-        L1 (Python) の計測を行い、CSVに即座に書き込む
-        """
+    def log_event(self, name: str):
+        """'with'文でイベントの開始・終了を記録する"""
         print(f"[{name}] 開始")
-        # Rustと合わせるため time.time() (UNIX時間) を使用
-        start_time = time.time() 
+        start_time = time.perf_counter()
         yield
-        end_time = time.time()
-        
-        duration = end_time - start_time
-        print(f"[{name}] 完了 ({duration:.4f}秒)")
-
-        # メモリにも残すが、CSVにも書く
+        end_time = time.perf_counter()
         self.records.append((name, start_time, end_time))
-        
-        with open(self.log_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([layer, name, f"{start_time:.6f}", f"{end_time:.6f}"])
+        print(f"[{name}] 完了 ({end_time - start_time:.4f}秒)")
 
-    def load_merged_records(self):
-        """
-        CSVからRust(L2-L4)のデータも含めて全データを読み込む
-        """
-        merged_records = []
-        if not os.path.exists(self.log_file):
-            return self.records
-
-        with open(self.log_file, "r") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if not row: continue
-                layer, name, start, end = row
-                # (表示名, 開始, 終了) のタプルにする
-                # グラフで見やすくするため、名前にレイヤーを付与
-                display_name = f"[{layer}] {name}"
-                merged_records.append((display_name, float(start), float(end)))
-        
-        return merged_records
 
 # ---------------------------------------------------------
 # 修正版: PerformanceCallbackHandler
@@ -176,16 +117,10 @@ def plot_timeline(records: list, output_filename: str = "timeline.png"):
     # --- 色の決定ロジック (追加) ---
     colors = []
     for name in event_names:
-        if "[L1]" in name:
-            colors.append('#1f77b4') # 青 (Python)
-        elif "[L2]" in name:
-            colors.append('#ff7f0e') # オレンジ (Rust Binding)
-        elif "[L3]" in name:
-            colors.append('#2ca02c') # 緑 (Frontend)
-        elif "[L4]" in name:
-            colors.append('#d62728') # 赤 (Engine)
+        if "全体フロー" == name or "ドキュメントロードと分割" == name :
+            colors.append('#d3d3d3')  # ライトグレー（背景的に扱う）
         else:
-            colors.append('#d3d3d3') # グレー
+            colors.append('#1f77b4')  # 青系（デフォルト：VDB/Embedding等の重要処理）
 
     # 描画処理
     fig, ax = plt.subplots(figsize=(12, len(event_names) * 0.6 + 1))
@@ -595,14 +530,9 @@ if __name__ == "__main__":
             print(f"\n質問と回答を {output_file} に保存しました")
             break # 1回で終了
 
-    # 3. CSVファイルから、Python(L1)とRust(L2-L4)全てのデータを読み込む
-    all_records = logger.load_merged_records()
-    
-    # 時間順にソート（念のため）
-    all_records.sort(key=lambda x: x[1])
 
-    # 4. 相対時刻に変換
-    logged_data_for_plot = convert_records_to_relative(all_records)
+    # 3. 記録済みの絶対時刻データを、描画用の相対時刻データに変換 ➡️
+    logged_data_for_plot = convert_records_to_relative(logger.records)
 
-    # 5. 描画
-    plot_timeline(logged_data_for_plot, output_filename="timeline_full_stack.png")
+    # 4. 変換したデータをプロット関数に渡す
+    plot_timeline(logged_data_for_plot)
