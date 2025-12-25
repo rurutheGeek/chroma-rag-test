@@ -376,7 +376,18 @@ def build_vector_store(docs, embeddings):
         
         # コレクションの存在確認と取得
         try:
+            # パラメータ指定
             col = client.get_collection(collection_name)
+            col = client.create_collection(
+                name=collection_name,
+                metadata={
+                    "hnsw:space": "cosine",       # 距離計算手法 (l2, cosine, ip)
+                    "hnsw:M": 16,                 # デフォルトは16
+                    "hnsw:ef_construction": 100,  # デフォルトは100
+                    "hnsw:batch_size": 100,       # インデックス更新のバッチサイズ
+                    "hnsw:sync_threshold": 1000   # 永続化のしきい値
+                }
+            )
             existing = col.count()
             print(f"既存コレクション '{collection_name}' を使用 (ドキュメント数: {existing})")
             return col

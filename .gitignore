@@ -1,11 +1,11 @@
 #.gitkeepファイルを目印として空のディレクトリを追跡する
 !.gitkeep
-.chroma
+.chroma*
 data/input/*
 data/output/*
 *.png
 !.gitkeep
-
+oldsource/*
 #トークンは共有しない(.envの中身は以下の通り)
 #DEEPSEEK_API_KEY=ここにbotトークン
 .env
